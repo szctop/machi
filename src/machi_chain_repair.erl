@@ -103,7 +103,8 @@ repair(ap_mode=ConsistencyMode, Src, Repairing, UPI, MembersDict, ETS, Opts) ->
     Add = fun(Name, Pid) -> put(proxies_dict, orddict:store(Name, Pid, get(proxies_dict))) end,
     OurFLUs = lists:usort([Src] ++ Repairing ++ UPI), % AP assumption!
     RepairMode = proplists:get_value(repair_mode, Opts, repair),
-    Verb = proplists:get_value(verbose, Opts, true),
+    Verb = proplists:get_value(verbose, Opts, false),
+    RepairId = proplists:get_value(repair_id, Opts, id1),
     Res = try
               _ = [begin
                        {ok, Proxy} = machi_proxy_flu1_client:start_link(P),
@@ -116,31 +117,39 @@ repair(ap_mode=ConsistencyMode, Src, Repairing, UPI, MembersDict, ETS, Opts) ->
                                        get_file_lists(Proxy, FLU, Dict)
                                end, D, ProxiesDict),
               MissingFileSummary = make_missing_file_summary(D2, OurFLUs),
-              ?VERB("MissingFileSummary ~p\n", [MissingFileSummary]),
+              %% ?VERB("~w MissingFileSummary ~p\n",[RepairId,MissingFileSummary]),
+              lager:info("Repair ~w MissingFileSummary ~p\n",
+                         [RepairId, MissingFileSummary]),
 
               [ets:insert(ETS, {{directive_bytes, FLU}, 0}) || FLU <- OurFLUs],
               %% Repair files from perspective of Src, i.e. tail(UPI).
               SrcProxy = orddict:fetch(Src, ProxiesDict),
               {ok, EpochID} = machi_proxy_flu1_client:get_epoch_id(
                                 SrcProxy, ?SHORT_TIMEOUT),
-              ?VERB("Make repair directives: "),
+              %% ?VERB("Make repair directives: "),
               Ds =
                   [{File, make_repair_directives(
                             ConsistencyMode, RepairMode, File, Size, EpochID,
                             Verb,
                             Src, OurFLUs, ProxiesDict, ETS)} ||
                       {File, {Size, _MissingList}} <- MissingFileSummary],
-              ?VERB(" done\n"),
+              %% ?VERB(" done\n"),
+              lager:info("Repair ~w repair directives finished\n", [RepairId]),
               [begin
                    [{_, Bytes}] = ets:lookup(ETS, {directive_bytes, FLU}),
-                   ?VERB("Out-of-sync data for FLU ~p: ~s MBytes\n",
-                         [FLU, mbytes(Bytes)])
+                   %% ?VERB("Out-of-sync data for FLU ~p: ~s MBytes\n",
+                   %%       [FLU, mbytes(Bytes)]),
+                   lager:info("Repair ~w "
+                              "Out-of-sync data for FLU ~p: ~s MBytes\n",
+                         [RepairId, FLU, mbytes(Bytes)]),
+                   ok
                end || FLU <- OurFLUs],
 
-              ?VERB("Execute repair directives: "),
+              %% ?VERB("Execute repair directives: "),
               ok = execute_repair_directives(ConsistencyMode, Ds, Src, EpochID,
                                              Verb, OurFLUs, ProxiesDict, ETS),
-              ?VERB(" done\n"),
+              %% ?VERB(" done\n"),
+              lager:info("Repair ~w repair directives finished\n", [RepairId]),
               ok
           catch
               What:Why ->
@@ -198,7 +207,7 @@ make_repair_compare_fun(SrcFLU) ->
             T_a =< T_b
     end.
 
-make_repair_directives(ConsistencyMode, RepairMode, File, Size, EpochID,
+make_repair_directives(ConsistencyMode, RepairMode, File, Size, _EpochID,
                        Verb, Src, FLUs0, ProxiesDict, ETS) ->
     true = (Size < ?MAX_OFFSET),
     FLUs = lists:usort(FLUs0),
@@ -207,7 +216,7 @@ make_repair_directives(ConsistencyMode, RepairMode, File, Size, EpochID,
               Proxy = orddict:fetch(FLU, ProxiesDict),
               OffSzCs =
                   case machi_proxy_flu1_client:checksum_list(
-                         Proxy, EpochID, File, ?LONG_TIMEOUT) of
+                         Proxy, File, ?LONG_TIMEOUT) of
                       {ok, InfoBin} ->
                           machi_csum_table:split_checksum_list_blob_decode(InfoBin);
                       {error, no_such_file} ->
@@ -227,7 +236,6 @@ make_repair_directives(ConsistencyMode, RepairMode, File, Size, EpochID,
 
 make_repair_directives2(C2, ConsistencyMode, RepairMode,
                        File, Verb, Src, FLUs, ProxiesDict, ETS) ->
-    ?VERB("."),
     make_repair_directives3(C2, ConsistencyMode, RepairMode,
                             File, Verb, Src, FLUs, ProxiesDict, ETS, []).
 
@@ -257,7 +265,18 @@ make_repair_directives3([{Offset, Size, CSum, _FLU}=A|Rest0],
             %%     byte range from all FLUs
             %% 3b. Log big warning about data loss.
             %% 4. Log any other checksum discrepencies as they are found.
-            exit({todo_repair_sanity_check, ?LINE, File, Offset, As})
+            QQ = [begin
+                      Pxy = orddict:fetch(FLU, ProxiesDict),
+                      {ok, EpochID} = machi_proxy_flu1_client:get_epoch_id(
+                                        Pxy, ?SHORT_TIMEOUT),
+                      NSInfo = undefined,
+                      XX = machi_proxy_flu1_client:read_chunk(
+                             Pxy, NSInfo, EpochID, File, Offset, Size, undefined,
+                             ?SHORT_TIMEOUT),
+                      {FLU, XX}
+                  end || {__Offset, __Size, __CSum, FLU} <- As],
+
+            exit({todo_repair_sanity_check, ?LINE, File, Offset, {as,As}, {qq,QQ}})
     end,
     %% List construction guarantees us that there's at least one ?MAX_OFFSET
     %% item remains.  Sort order + our "taking" of all exact Offset+Size
@@ -310,23 +329,25 @@ execute_repair_directives(ap_mode=_ConsistencyMode, Ds, _Src, EpochID, Verb,
                             {ProxiesDict, EpochID, Verb, ETS}, Ds),
     ok.
 
-execute_repair_directive({File, Cmds}, {ProxiesDict, EpochID, Verb, ETS}=Acc) ->
+execute_repair_directive({File, Cmds}, {ProxiesDict, EpochID, _Verb, ETS}=Acc) ->
     EtsKeys = [{in_files, t_in_files}, {in_chunks, t_in_chunks},
                {in_bytes, t_in_bytes}, {out_files, t_out_files},
                {out_chunks, t_out_chunks}, {out_bytes, t_out_bytes}],
     [ets:insert(ETS, {L_K, 0}) || {L_K, _T_K} <- EtsKeys],
     F = fun({copy, {Offset, Size, TaggedCSum, MySrc}, MyDsts}, Acc2) ->
                 SrcP = orddict:fetch(MySrc, ProxiesDict),
-                case ets:lookup_element(ETS, in_chunks, 2) rem 100 of
-                    0 -> ?VERB(".", []);
-                    _ -> ok
-                end,
+                %% case ets:lookup_element(ETS, in_chunks, 2) rem 100 of
+                %%     0 -> ?VERB(".2", []);
+                %%     _ -> ok
+                %% end,
                 _T1 = os:timestamp(),
                 %% TODO: support case multiple written or trimmed chunks returned
-                {ok, {[{_, Offset, Chunk, _}], _}} =
+                NSInfo = undefined,
+                {ok, {[{_, Offset, Chunk, _ReadCSum}|OtherChunks], []=_TrimmedList}} =
                     machi_proxy_flu1_client:read_chunk(
-                      SrcP, EpochID, File, Offset, Size, [],
+                      SrcP, NSInfo, EpochID, File, Offset, Size, undefined,
                       ?SHORT_TIMEOUT),
+                [] = OtherChunks,
                 _T2 = os:timestamp(),
                 <<_Tag:1/binary, CSum/binary>> = TaggedCSum,
                 case machi_util:checksum_chunk(Chunk) of
@@ -335,7 +356,7 @@ execute_repair_directive({File, Cmds}, {ProxiesDict, EpochID, Verb, ETS}=Acc) ->
                                  DstP = orddict:fetch(DstFLU, ProxiesDict),
                                  _T3 = os:timestamp(),
                                  ok = machi_proxy_flu1_client:write_chunk(
-                                        DstP, EpochID, File, Offset, Chunk,
+                                        DstP, NSInfo, EpochID, File, Offset, Chunk, TaggedCSum,
                                         ?SHORT_TIMEOUT),
                                  _T4 = os:timestamp()
                              end || DstFLU <- MyDsts],
